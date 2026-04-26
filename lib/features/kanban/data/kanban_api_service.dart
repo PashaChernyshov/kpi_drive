@@ -78,9 +78,9 @@ class KanbanApiService {
     required String fieldValue,
   }) async {
     try {
-      // In the spec, load and save use different periods. We try the save
-      // period from the spec first, then retry with the board load period if
-      // the backend rejects saving in the spec period for current tasks.
+      // The spec uses a different save period than the loaded board. We try the
+      // save-example period first and fall back to the actual board period when
+      // the backend rejects the request or returns a non-applied ghost-success.
       var response = await _sendSaveRequest(
         taskId: taskId,
         fieldName: fieldName,
@@ -88,7 +88,7 @@ class KanbanApiService {
         baseFields: _saveBaseFields,
       );
 
-      if (!response.isSuccessful && _shouldRetrySaveWithLoadPeriod(response)) {
+      if (_shouldRetrySaveWithLoadPeriod(response, fieldName: fieldName)) {
         response = await _sendSaveRequest(
           taskId: taskId,
           fieldName: fieldName,
@@ -97,32 +97,7 @@ class KanbanApiService {
         );
       }
 
-      if (!response.isSuccessful) {
-        throw ApiException(_mapSaveError(response.statusCode, response.body));
-      }
-
-      final payload = response.decodedBody;
-      if (payload is Map<String, dynamic>) {
-        final status = payload['STATUS']?.toString().toUpperCase();
-        final messages = payload['MESSAGES'];
-        final errorMessage = _extractBackendError(messages);
-        if (status != 'OK' || errorMessage != null) {
-          throw ApiException(errorMessage ?? 'Backend не подтвердил сохранение.');
-        }
-        return;
-      }
-
-      if (payload is Map) {
-        final normalized = payload.map(
-          (key, value) => MapEntry(key.toString(), value),
-        );
-        final status = normalized['STATUS']?.toString().toUpperCase();
-        if (status == 'OK') {
-          return;
-        }
-      }
-
-      throw const ApiException('Backend вернул неожиданный ответ при сохранении.');
+      _ensureSaveSucceeded(response);
     } on ApiException {
       rethrow;
     } catch (error) {
@@ -147,6 +122,93 @@ class KanbanApiService {
       bearerToken: config.shouldSendBearerToken ? config.token : null,
       timeout: _saveTimeout,
     );
+  }
+
+  void _ensureSaveSucceeded(ApiResponse response) {
+    if (!response.isSuccessful) {
+      throw ApiException(_mapSaveError(response.statusCode, response.body));
+    }
+
+    final payload = response.decodedBody;
+    if (payload is Map<String, dynamic>) {
+      final status = payload['STATUS']?.toString().toUpperCase();
+      final messages = payload['MESSAGES'];
+      final errorMessage = _extractBackendError(messages);
+      if (status != 'OK' || errorMessage != null) {
+        throw ApiException(errorMessage ?? 'Backend не подтвердил сохранение.');
+      }
+      return;
+    }
+
+    if (payload is Map) {
+      final normalized = payload.map(
+        (key, value) => MapEntry(key.toString(), value),
+      );
+      final status = normalized['STATUS']?.toString().toUpperCase();
+      if (status == 'OK') {
+        return;
+      }
+    }
+
+    throw const ApiException('Backend вернул неожиданный ответ при сохранении.');
+  }
+
+  bool _shouldRetrySaveWithLoadPeriod(
+    ApiResponse response, {
+    required String fieldName,
+  }) {
+    if (!response.isSuccessful) {
+      return _shouldRetryRejectedSave(response.body, response.statusCode);
+    }
+
+    final payload = response.decodedBody;
+    if (payload is! Map) {
+      return false;
+    }
+
+    final normalized = payload.map(
+      (key, value) => MapEntry(key.toString(), value),
+    );
+    final messages = normalized['MESSAGES'];
+    final warningText = _extractBackendWarning(messages)?.toLowerCase() ?? '';
+    final data = normalized['DATA'];
+
+    final looksLikeGhostSuccess = warningText.contains('не удалось получить данные') &&
+        (data == null || (data is Map && data.isEmpty));
+
+    if (looksLikeGhostSuccess) {
+      return true;
+    }
+
+    // parent_id/order saves normally come back with DATA or with a stable OK
+    // body from the actual board period. If the save-example period returns OK
+    // but no data and a generic warning, prefer retrying on the loaded period.
+    if ((fieldName == 'parent_id' || fieldName == 'order') &&
+        warningText.isNotEmpty &&
+        warningText.contains('показател')) {
+      return true;
+    }
+
+    return false;
+  }
+
+  bool _shouldRetryRejectedSave(String body, int statusCode) {
+    if (!(statusCode == 400 ||
+        statusCode == 401 ||
+        statusCode == 403 ||
+        statusCode == 422)) {
+      return false;
+    }
+
+    final lower = body.toLowerCase();
+    return lower.contains('закрытом периоде') ||
+        lower.contains('closed period') ||
+        lower.contains('period') ||
+        lower.contains('невозможно сохранить') ||
+        lower.contains('cannot save') ||
+        lower.contains('не найден') ||
+        lower.contains('not found') ||
+        lower.contains('indicator');
   }
 
   List<Map<String, dynamic>>? _extractTaskList(dynamic payload) {
@@ -238,25 +300,6 @@ class KanbanApiService {
     return 'Не удалось сохранить изменения ($statusCode). ${_buildSnippet(body)}';
   }
 
-  bool _shouldRetrySaveWithLoadPeriod(ApiResponse response) {
-    if (!(response.statusCode == 400 ||
-        response.statusCode == 401 ||
-        response.statusCode == 403 ||
-        response.statusCode == 422)) {
-      return false;
-    }
-
-    final body = response.body.toLowerCase();
-    return body.contains('закрытом периоде') ||
-        body.contains('closed period') ||
-        body.contains('period') ||
-        body.contains('невозможно сохранить') ||
-        body.contains('cannot save') ||
-        body.contains('не найден') ||
-        body.contains('not found') ||
-        body.contains('indicator');
-  }
-
   String? _extractBackendError(dynamic messages) {
     if (messages is! Map) {
       return null;
@@ -272,6 +315,27 @@ class KanbanApiService {
     }
 
     final text = error.toString().trim();
+    if (text.isEmpty || text == 'null') {
+      return null;
+    }
+    return text;
+  }
+
+  String? _extractBackendWarning(dynamic messages) {
+    if (messages is! Map) {
+      return null;
+    }
+
+    final warning = messages['warning'];
+    if (warning == null) {
+      return null;
+    }
+
+    if (warning is List && warning.isNotEmpty) {
+      return warning.join(' ');
+    }
+
+    final text = warning.toString().trim();
     if (text.isEmpty || text == 'null') {
       return null;
     }
